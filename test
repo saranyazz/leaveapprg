@@ -1,0 +1,101 @@
+name: CI/CD – Single Job with Tests
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: 18
+  AZURE_WEBAPP_NAME: ctsleavech
+  BACKEND_URL: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net
+  FRONTEND_URL: https://${{ secrets.FRONTEND_DOMAIN }}   # e.g. yoursite.vercel.app
+
+jobs:
+  build_test_deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          backend/node_modules
+          frontend/node_modules
+        key: ${{ runner.os }}-deps-${{ hashFiles('**/package-lock.json') }}
+
+    # Backend Tests
+    - name: Install & run backend unit tests
+      working-directory: backend
+      run: |
+        npm ci
+        npm test
+
+    - name: Run backend integration tests
+      working-directory: backend
+      env:
+        BACKEND_URL: ${{ env.BACKEND_URL }}
+      run: npm run test:integration
+
+    # Build & Deploy Backend
+    - name: Build backend
+      working-directory: backend
+      run: |
+        npm ci
+        npm run build
+
+    - name: Zip & deploy backend to Azure
+      run: |
+        cd backend
+        zip -r ../backend.zip .
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: ${{ env.AZURE_WEBAPP_NAME }}
+        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        package: backend.zip
+
+    - name: Wait for backend readiness
+      run: |
+        for i in {1..12}; do
+          status=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.BACKEND_URL }}/health)
+          if [ "$status" -eq 200 ]; then
+            echo "Backend is live!"
+            break
+          fi
+          echo "Waiting for backend... ($i/12)"
+          sleep 5
+        done
+
+    - name: Seed sample data
+      run: curl --fail ${{ env.BACKEND_URL }}/api/seed
+
+    # Frontend Build & Deploy
+    - name: Install & build frontend
+      working-directory: frontend
+      run: |
+        npm ci
+        npm run build
+
+    - name: Deploy frontend to Vercel
+      uses: amondnet/vercel-action@v20
+      with:
+        vercel-token: ${{ secrets.VERCEL_TOKEN }}
+        vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+        vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+        working-directory: ./frontend
+        vercel-args: '--prod'
+
+    - name: Run Cypress E2E tests
+      working-directory: frontend
+      env:
+        FRONTEND_URL: ${{ env.FRONTEND_URL }}
+      run: npm run cy:run
